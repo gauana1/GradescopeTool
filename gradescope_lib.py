@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-import os
-import time
-import json
-from pathlib import Path
-from playwright.sync_api import sync_playwright, Page
-import subprocess
-import re
-import requests
-import zipfile
-import tarfile
+import gradescope_course_manager as gcm
 import shutil
+import tarfile
+import zipfile
+import requests
+import re
+import subprocess
+from playwright.sync_api import sync_playwright, Page
+from pathlib import Path
+import json
+import time
+import os
 
 CONFIG = {
     'output_dir': 'gradescope_archive',
     'auth_file': 'gradescope_auth.json',
     'delay': 2,
     'headless': False,
-    'max_retries': 3
+    'max_retries': 3,
+    'update_threshold_hours': 24
 }
 
 def setup_auth():
@@ -267,45 +269,52 @@ def _get_full_extension(filepath: Path) -> str:
 
 
 def _try_graded_pdf_download_requests(page: Page, assignment_name: str, assignment_dir: Path) -> bool:
-    """Attempt to download the graded PDF directly via requests. Returns True if successful."""
-    try:
-        download_link_locator = page.get_by_role("link", name="Download Graded Copy")
-        # Wait a bit for the element to be ready without strictly expecting it to be visible
-        # as we are just trying to extract href
-        pdf_url = download_link_locator.get_attribute('href', timeout=2000)
-        
-        if not pdf_url:
-            print("      ✗ Could not extract PDF URL for requests download.")
-            return False
-        
-        # Make URL absolute
-        if pdf_url.startswith('/'):
-            pdf_url = f"https://www.gradescope.com{pdf_url}"
-        
-        # Download using requests with session cookies
-        cookies = {c['name']: c['value'] for c in page.context.cookies()}
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                         'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
-        }
-        
-        print(f"    Downloading PDF directly via requests from: {pdf_url[:60]}...")
-        response = requests.get(pdf_url, cookies=cookies, headers=headers, allow_redirects=True)
-        response.raise_for_status()
-        
-        # Sanitize filename
-        safe_name = "".join(c for c in assignment_name if c.isalnum() or c in '._- ').strip()
-        filename = f"{safe_name}_graded.pdf"
-        filepath = assignment_dir / filename
-        
-        filepath.write_bytes(response.content)
-        print(f"      ✓ Saved (requests): '{filename}'")
-        return True
-        
-    except Exception as e:
-        print(f"      ✗ PDF download (requests) failed: {e}")
-        return False
-def download_course(page: Page, course: dict, output_dir: str):
+    """Attempt to download the graded PDF directly via requests, with retries. Returns True if successful."""
+    for i in range(CONFIG['max_retries']):
+        try:
+            download_link_locator = page.get_by_role("link", name="Download Graded Copy")
+            pdf_url = download_link_locator.get_attribute('href', timeout=2000)
+            
+            if not pdf_url:
+                print("      ✗ Could not extract PDF URL for requests download.")
+                return False
+            
+            if pdf_url.startswith('/'):
+                pdf_url = f"https://www.gradescope.com{pdf_url}"
+            
+            cookies = {c['name']: c['value'] for c in page.context.cookies()}
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                             'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
+            }
+            
+            print(f"    Downloading PDF directly via requests from: {pdf_url[:60]}...")
+            response = requests.get(pdf_url, cookies=cookies, headers=headers, allow_redirects=True)
+            
+            if 500 <= response.status_code < 600:
+                print(f"      ! Server error ({response.status_code}). Retrying in {CONFIG['delay']}s... (Attempt {i+1}/{CONFIG['max_retries']})")
+                time.sleep(CONFIG['delay'])
+                continue # Go to the next iteration of the retry loop
+            
+            response.raise_for_status() # Raise an exception for other bad status codes (4xx)
+            
+            safe_name = "".join(c for c in assignment_name if c.isalnum() or c in '._- ').strip()
+            filename = f"{safe_name}_graded.pdf"
+            filepath = assignment_dir / filename
+            
+            filepath.write_bytes(response.content)
+            print(f"      ✓ Saved (requests): '{filename}'")
+            return True # Success
+            
+        except Exception as e:
+            print(f"      ✗ PDF download (requests) failed: {e}")
+            if i < CONFIG['max_retries'] - 1:
+                time.sleep(CONFIG['delay'])
+            continue # Go to the next iteration of the retry loop
+
+    print(f"      ✗ PDF download failed after {CONFIG['max_retries']} retries.")
+    return False
+def download_course(page: Page, course: dict, course_id: str, output_dir: str):
     """Downloads all graded assignments for one course."""
     print(f"\nProcessing course: {course['full_name']}")
     sanitized_name = "".join([c for c in course['full_name'] if c.isalnum() or c in ' -']).strip()
@@ -343,7 +352,89 @@ def download_course(page: Page, course: dict, output_dir: str):
         
         download_assignment(page, assignment_name, assignment_url, assignment_dir)
 
-        time.sleep(CONFIG['delay'])
+    # After processing all assignments, update the timestamp
+    gcm.update_course_timestamp(course_id)
+    time.sleep(CONFIG['delay'])
+
+def rename_course_repo(old_name: str, new_name: str, course_id: str):
+    """
+    Creates a new, renamed copy of a course archive with its own new GitHub repository.
+    The original directory and repository are left untouched.
+    """
+    print(f"--- Creating a new, renamed course archive: '{new_name}' from '{old_name}' ---")
+
+    # 1. Check for gh CLI
+    if shutil.which("gh") is None:
+        print("  ERROR: The 'gh' command-line tool is not installed or not in your PATH.")
+        print("         Please install it to use this feature: https://cli.github.com/")
+        return
+
+    # 2. Sanitize names
+    sanitized_old_name = "".join([c for c in old_name if c.isalnum() or c in ' -']).strip()
+    sanitized_new_name = "".join([c for c in new_name if c.isalnum() or c in ' -']).strip()
+    
+    old_path = Path(CONFIG['output_dir']) / sanitized_old_name
+    new_path = Path(CONFIG['output_dir']) / sanitized_new_name
+    
+    if not old_path.exists():
+        print(f"  ERROR: Original directory '{old_path}' not found. Cannot create a renamed copy.")
+        return
+        
+    if new_path.exists():
+        print(f"  ERROR: A directory already exists at '{new_path}'. Please choose a different name.")
+        return
+
+    original_cwd = os.getcwd()
+    try:
+        # 3. Copy the directory
+        shutil.copytree(old_path, new_path)
+        print(f"  ✓ Successfully copied '{old_path}' to '{new_path}'.")
+        
+        # 4. Navigate into the new directory and create a new Git repo
+        os.chdir(new_path)
+        
+        # Remove the old .git directory if it was copied
+        old_git_dir = new_path / '.git'
+        if old_git_dir.exists():
+            shutil.rmtree(old_git_dir)
+            print("  - Removed old .git directory from the new folder.")
+
+        # Initialize a new Git repository
+        subprocess.run(['git', 'init'], check=True, capture_output=True)
+        subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
+        subprocess.run(['git', 'commit', '-m', f"Initial commit for renamed course: {new_name}"], check=True, capture_output=True)
+        print(f"  ✓ Initialized a new Git repository in '{new_path}'.")
+
+        # 5. Create a new remote GitHub repository
+        new_repo_name = "".join([c for c in new_name if c.isalnum() or c in '-']).strip().replace(' ', '-')
+        print(f"  Creating new PUBLIC GitHub repository '{new_repo_name}'...")
+        
+        try:
+            subprocess.run(['gh', 'repo', 'create', new_repo_name, '--public', '--source=.', '--remote=origin'], check=True, capture_output=True, text=True)
+            print(f"  ✓ Successfully created remote GitHub repository '{new_repo_name}'.")
+            
+            # Push to the new remote
+            print("  Pushing to new GitHub repository...")
+            subprocess.run(['git', 'branch', '-M', 'main'], check=True, capture_output=True)
+            subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True, capture_output=True)
+            print("  ✓ Successfully pushed to new repository.")
+            
+        except subprocess.CalledProcessError as e:
+            print(f"  ✗ ERROR: Failed to create or push to GitHub repository. Details: {e.stderr.strip()}")
+            print("           Please ensure 'gh' CLI is installed and authenticated.")
+            print("           You may need to manually create the repo and push.")
+            
+        # 6. Update the course data in JSON
+        gcm.rename_course_in_json(course_id, new_name)
+        
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        print(f"  ✗ ERROR: A Git or file operation failed. Details: {e}")
+        if isinstance(e, subprocess.CalledProcessError):
+            print(f"     Stderr: {e.stderr}")
+    except Exception as e:
+        print(f"  ✗ ERROR: An unexpected error occurred. Details: {e}")
+    finally:
+        os.chdir(original_cwd)
 
 def create_git_repo(course_dir: Path, course_name: str):
     """Initializes and pushes a git repository for a course."""
@@ -355,22 +446,49 @@ def create_git_repo(course_dir: Path, course_name: str):
     original_cwd = os.getcwd()
     os.chdir(course_dir)
     try:
-        subprocess.run(['git', 'init'], check=True, capture_output=True)
-        subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
-        if subprocess.run(['git', 'status', '--porcelain'], capture_output=True).stdout:
-            subprocess.run(['git', 'commit', '-m', f"Initial archive for {course_name}"], check=True, capture_output=True)
+        # Check if already a git repo
+        if (Path(course_dir) / '.git').exists():
+            print(f"  {course_dir.name} is already a Git repository. Skipping initialization.")
+        else:
+            subprocess.run(['git', 'init'], check=True, capture_output=True)
+            subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
+            if subprocess.run(['git', 'status', '--porcelain'], capture_output=True).stdout:
+                subprocess.run(['git', 'commit', '-m', f"Initial commit: Gradescope archive for {course_name}"], check=True, capture_output=True)
+                print(f"  Git repository initialized and initial commit made at {course_dir}")
+            else:
+                print(f"  No changes to commit for {course_name}.")
         
-        repo_name = "".join([c for c in course_name if c.isalnum() or c in '-']).strip().replace(' ', '-')
-        if "origin" not in subprocess.run(['git', 'remote', '-v'], capture_output=True, text=True).stdout:
-            print(f"Creating public GitHub repository '{repo_name}'...")
-            subprocess.run(['gh', 'repo', 'create', repo_name, '--public', '--source=.', '--remote=origin'], check=True, capture_output=True, text=True)
+        # Create GitHub repository and push
+        sanitized_repo_name = "".join([c for c in course_name if c.isalnum() or c in '-']).strip().replace(' ', '-')
         
-        print("Pushing to GitHub...")
+        # Check if remote named 'origin' exists
+        result = subprocess.run(['git', 'remote', '-v'], capture_output=True, text=True)
+        if "origin" not in result.stdout:
+            print(f"  Creating PUBLIC GitHub repository '{sanitized_repo_name}'...")
+            try:
+                subprocess.run(['gh', 'repo', 'create', sanitized_repo_name, '--public', '--source=.', '--remote=origin'], check=True, capture_output=True, text=True)
+                print(f"  ✓ Successfully created remote GitHub repository '{sanitized_repo_name}'.")
+            except subprocess.CalledProcessError as e:
+                print(f"  ✗ ERROR: Failed to create GitHub repository. Details: {e.stderr.strip()}")
+                print("           Please ensure 'gh' CLI is installed and authenticated.")
+                # Continue without pushing if repo creation fails
+                return
+        else:
+            print(f"  Remote 'origin' already exists. Skipping remote repository creation.")
+
+        print("  Pushing to GitHub...")
         subprocess.run(['git', 'branch', '-M', 'main'], check=True, capture_output=True)
         subprocess.run(['git', 'push', '-u', 'origin', 'main', '--force'], check=True, capture_output=True)
-        print(f"Successfully pushed to GitHub repository: {repo_name}")
+        print(f"  ✓ Successfully pushed to GitHub repository: {sanitized_repo_name}")
+        
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        print(f"ERROR: Git/GitHub operation failed. Ensure 'gh' is installed and authenticated. Details: {e}")
+        print(f"  ✗ ERROR: Git/GitHub operation failed for {course_name}. Details: {e}")
+        if isinstance(e, subprocess.CalledProcessError):
+            print(f"     Stdout: {e.stdout.decode().strip()}")
+            print(f"     Stderr: {e.stderr.decode().strip()}")
+        print("           Please ensure 'gh' CLI is installed and authenticated and Git is configured.")
+    except Exception as e:
+        print(f"  ✗ ERROR: An unexpected error occurred during Git operations. Details: {e}")
     finally:
         os.chdir(original_cwd)
 

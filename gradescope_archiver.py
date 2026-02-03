@@ -2,6 +2,7 @@
 import argparse
 from pathlib import Path
 from playwright.sync_api import sync_playwright
+from datetime import datetime
 import json
 import gradescope_lib as gs_lib
 import gradescope_course_manager as gcm
@@ -16,10 +17,28 @@ def main():
     parser.add_argument('--download-all', action='store_true', help='Download all courses and assignments (non-interactive).')
     parser.add_argument('--test-course', type=str, help='Download a single course by its full name.')
     parser.add_argument('--update-courses', action='store_true', help='Update the courses.json file with the latest course list.')
+    parser.add_argument('--update-stale-courses', action='store_true', help='Re-download courses that have not been updated recently.')
+    parser.add_argument('--rename-courses', action='store_true', help='Rename local course directories based on the "rename" field in courses.json.')
     args = parser.parse_args()
 
     if args.setup:
         gs_lib.setup_auth()
+        return
+        
+    if args.rename_courses:
+        print("--- Renaming Courses (no web interaction) ---")
+        courses_data = gcm.load_courses_from_json()
+        if not courses_data:
+            print("courses.json is empty. Nothing to rename.")
+            return
+            
+        for course_id, course_data in courses_data.items():
+            if course_data.get('rename'):
+                print(f"Renaming course: '{course_data['full_name']}' to '{course_data['rename']}'")
+                gs_lib.rename_course_repo(course_data['full_name'], course_data['rename'], course_id)
+                gcm.rename_course_in_json(course_id, course_data['rename'])
+        
+        print("\n--- Course renaming finished. ---")
         return
 
     if not Path(gs_lib.CONFIG['auth_file']).exists():
@@ -40,7 +59,11 @@ def main():
             print("--- Starting Download All Mode ---")
             all_courses = gs_lib.get_courses(page)
             for course in all_courses:
-                gs_lib.download_course(page, course, gs_lib.CONFIG['output_dir'])
+                gs_lib.download_course(page, course, course['url'], gs_lib.CONFIG['output_dir'])
+                
+                sanitized_name = "".join([c for c in course['full_name'] if c.isalnum() or c in ' -']).strip()
+                course_dir = Path(gs_lib.CONFIG['output_dir']) / sanitized_name
+                gs_lib.create_git_repo(course_dir, course['full_name'])
             print("\n--- All courses have been processed. ---")
         elif args.test_course:
             print(f"--- Testing download for course: {args.test_course} ---")
@@ -48,7 +71,11 @@ def main():
             target_course = next((c for c in all_courses if c['full_name'] == args.test_course), None)
             
             if target_course:
-                gs_lib.download_course(page, target_course, gs_lib.CONFIG['output_dir'])
+                gs_lib.download_course(page, target_course, target_course['url'], gs_lib.CONFIG['output_dir'])
+                
+                sanitized_name = "".join([c for c in target_course['full_name'] if c.isalnum() or c in ' -']).strip()
+                course_dir = Path(gs_lib.CONFIG['output_dir']) / sanitized_name
+                gs_lib.create_git_repo(course_dir, target_course['full_name'])
                 print(f"\n--- Test download finished for {args.test_course}. ---")
             else:
                 print(f"ERROR: Course '{args.test_course}' not found.")
@@ -56,11 +83,37 @@ def main():
         elif args.update_courses:
             print("--- Updating courses.json ---")
             all_courses = gs_lib.get_courses(page)
-            updated_courses = gcm.update_course_data(all_courses)
+            gcm.update_course_data(all_courses) # Now just updates the file
+            updated_courses_for_display = gcm.load_courses_from_json() # Reload for display
             print("\n--- courses.json content: ---")
-            print(json.dumps(updated_courses, indent=4))
+            # Custom encoder to handle datetime objects for printing
+            class DateTimeEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    if isinstance(obj, datetime):
+                        return obj.isoformat()
+                    return json.JSONEncoder.default(self, obj)
+            print(json.dumps(updated_courses_for_display, indent=4, cls=DateTimeEncoder))
+        elif args.update_stale_courses:
+            print("--- Updating Stale Courses ---")
+            courses_data = gcm.load_courses_from_json()
+            if not courses_data:
+                print("courses.json is empty. Run with --update-courses first.")
+                return
+
+            for course_id, course_data in courses_data.items():
+                # Handle conditional update
+                time_since_update = datetime.now() - course_data['timestamp']
+                if time_since_update.total_seconds() > gs_lib.CONFIG['update_threshold_hours'] * 3600:
+                    print(f"Course '{course_data['full_name']}' is older than {gs_lib.CONFIG['update_threshold_hours']} hours. Re-downloading...")
+                    gs_lib.download_course(page, course_data, course_id, gs_lib.CONFIG['output_dir'])
+                    
+                    sanitized_name = "".join([c for c in course_data['full_name'] if c.isalnum() or c in ' -']).strip()
+                    course_dir = Path(gs_lib.CONFIG['output_dir']) / sanitized_name
+                    gs_lib.create_git_repo(course_dir, course_data['full_name'])
+            
+            print("\n--- Stale course update finished. ---")
         else:
-            print("--- Listing All Discovered Courses (run with --interactive, --test-course, or --update-courses) ---")
+            print("--- Listing All Discovered Courses (run with --interactive, --test-course, --update-courses, or --update-stale-courses) ---")
             all_courses = gs_lib.get_courses(page)
             if all_courses:
                 for course in all_courses:
