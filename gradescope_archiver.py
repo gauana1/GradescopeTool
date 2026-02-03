@@ -43,7 +43,7 @@ def main():
             all_courses = gs_lib.get_courses(page)
             if all_courses:
                 for course in all_courses:
-                    print(f"- {course['name']}")
+                    print(f"- {course['full_name']}")
         
         browser.close()
         print("\nDone.")
