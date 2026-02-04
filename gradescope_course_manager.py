@@ -46,7 +46,8 @@ def update_course_data(discovered_courses):
                 'term': course['term'],
                 'url': course['url'],
                 'timestamp': datetime.now(),
-                'rename': ""
+                'rename': "",
+                'github_repo': ""  # <-- new field here
             }
             
     if new_courses_added > 0:

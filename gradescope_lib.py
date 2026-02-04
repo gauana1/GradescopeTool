@@ -8,6 +8,7 @@ import re
 import subprocess
 from playwright.sync_api import sync_playwright, Page
 from pathlib import Path
+from datetime import datetime
 import json
 import time
 import os
@@ -18,7 +19,8 @@ CONFIG = {
     'delay': 2,
     'headless': False,
     'max_retries': 3,
-    'update_threshold_hours': 24
+    'update_threshold_hours': 24,
+    'DEFAULT_REPO_PRIVATE': True
 }
 
 def setup_auth():
@@ -129,7 +131,10 @@ def download_assignment(page: Page, assignment_name: str, assignment_url: str, a
 
 
 def _try_direct_downloads(page: Page, assignment_name: str, assignment_dir: Path) -> int:
-    """Attempt to download all available files directly. Returns the count of successful downloads."""
+    """
+    Attempt to download all available files directly. 
+    Extract only top-level archives. Returns the count of successful downloads.
+    """
     print("    Looking for direct download links...")
     
     direct_download_selectors = [
@@ -145,14 +150,12 @@ def _try_direct_downloads(page: Page, assignment_name: str, assignment_dir: Path
         'a[href$=".c"]',
         'a[href$=".h"]',
         'a[href$=".txt"]',
-        'a[href$=".pdf"]', # Added to handle PDFs here
-        'a:has-text("Download Graded Copy")', # Specific selector for graded PDF
+        'a[href$=".pdf"]',
+        'a:has-text("Download Graded Copy")',  # Specific selector for graded PDF
     ]
     
     successful_downloads = 0
-    
-    # Use a set to track already processed URLs to avoid redundant downloads if multiple selectors match the same link
-    downloaded_urls = set()
+    downloaded_urls = set()  # Avoid duplicate downloads
 
     for selector in direct_download_selectors:
         links = page.locator(selector).all()
@@ -161,7 +164,7 @@ def _try_direct_downloads(page: Page, assignment_name: str, assignment_dir: Path
             try:
                 href = link.get_attribute('href')
                 if not href or href in downloaded_urls:
-                    continue # Skip if no href or already processed
+                    continue
                 
                 print(f"    Attempting download {i+1} (selector: '{selector}', href: '{href[:50]}...')")
                 
@@ -175,32 +178,30 @@ def _try_direct_downloads(page: Page, assignment_name: str, assignment_dir: Path
                 
                 print(f"      ✓ Downloaded: '{filename}'")
                 successful_downloads += 1
-                downloaded_urls.add(href) # Mark this URL as downloaded
+                downloaded_urls.add(href)
                 
-                # Extract if it's an archive
+                # Extract top-level archive only
                 _extract_if_archive(filepath, assignment_dir)
                 
             except Exception as e:
-                print(f"      ✗ Download failed for link (selector: '{selector}', href: '{href[:50] if href else 'N/A'}'). Details: {str(e)[:100]}")
+                print(f"      ✗ Download failed (selector: '{selector}'). Details: {str(e)[:100]}")
                 continue
     
-    # Fallback: Also attempt to download graded PDF using requests if no Playwright download was triggered
-    # This acts as a robust fallback for "Download Graded Copy" if the click above fails to trigger a Playwright download
-    if successful_downloads == 0:
-        if _try_graded_pdf_download_requests(page, assignment_name, assignment_dir):
-            successful_downloads += 1
+    # Fallback: attempt to download graded PDF via requests if nothing downloaded
+    if successful_downloads == 0 and _try_graded_pdf_download_requests(page, assignment_name, assignment_dir):
+        successful_downloads += 1
 
     return successful_downloads
 
 
 def _extract_if_archive(filepath: Path, extract_to: Path):
-    """Extract archive and recursively extract nested archives."""
+    """Extract only the top-level archive (no nested extraction)."""
     ext = _get_full_extension(filepath)
     
     if ext not in ['.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2']:
         return  # Not an archive
     
-    print(f"      Detected archive: {ext}. Extracting...")
+    print(f"      Detected archive: {ext}. Extracting to top level...")
     
     try:
         if ext == '.zip':
@@ -210,50 +211,12 @@ def _extract_if_archive(filepath: Path, extract_to: Path):
             with tarfile.open(filepath, 'r:*') as tf:
                 tf.extractall(extract_to)
         
-        print(f"      ✓ Extracted to '{extract_to}'")
-        filepath.unlink()  # Delete the archive
+        print(f"      ✓ Extracted top-level archive to '{extract_to}'")
+        filepath.unlink()  # Delete the archive after extraction
         print(f"      Deleted original archive: '{filepath.name}'")
-        
-        # Extract nested archives
-        _extract_nested_archives(extract_to)
         
     except Exception as e:
         print(f"      ✗ Extraction failed: {e}")
-
-
-def _extract_nested_archives(directory: Path):
-    """Recursively find and extract nested archives."""
-    print("      Scanning for nested archives...")
-    
-    # Collect all archive files first (don't modify while walking)
-    archives = []
-    for root, dirs, files in os.walk(directory):
-        for filename in files:
-            filepath = Path(root) / filename
-            ext = _get_full_extension(filepath)
-            if ext in ['.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2']:
-                archives.append(filepath)
-    
-    # Now extract them
-    for archive_path in archives:
-        print(f"        Found nested archive: {archive_path.name}")
-        try:
-            ext = _get_full_extension(archive_path)
-            extract_dir = archive_path.parent
-            
-            if ext == '.zip':
-                with zipfile.ZipFile(archive_path, 'r') as zf:
-                    zf.extractall(extract_dir)
-            else:
-                with tarfile.open(archive_path, 'r:*') as tf:
-                    tf.extractall(extract_dir)
-            
-            print(f"        ✓ Extracted nested archive")
-            archive_path.unlink()
-            print(f"        Deleted: {archive_path.name}")
-            
-        except Exception as e:
-            print(f"        ✗ Failed to extract {archive_path.name}: {e}")
 
 
 def _get_full_extension(filepath: Path) -> str:
@@ -355,162 +318,176 @@ def download_course(page: Page, course: dict, course_id: str, output_dir: str):
     # After processing all assignments, update the timestamp
     gcm.update_course_timestamp(course_id)
     time.sleep(CONFIG['delay'])
+    
 
 def rename_course_repo(old_name: str, new_name: str, course_id: str):
     """
-    Creates a new, renamed copy of a course archive with its own new GitHub repository.
-    The original directory and repository are left untouched.
+    Renames both the local course directory and its GitHub repository
+    using the github_repo field stored in courses.json.
     """
-    print(f"--- Creating a new, renamed course archive: '{new_name}' from '{old_name}' ---")
+    print(f"\n--- Renaming course: '{old_name}' -> '{new_name}' ---")
 
-    # 1. Check for gh CLI
-    if shutil.which("gh") is None:
-        print("  ERROR: The 'gh' command-line tool is not installed or not in your PATH.")
-        print("         Please install it to use this feature: https://cli.github.com/")
-        return
+    courses_data = gcm.load_courses_from_json()
+    if course_id not in courses_data:
+        print(f"ERROR: Course ID '{course_id}' not found in JSON.")
+        return False
 
-    # 2. Sanitize names
-    sanitized_old_name = "".join([c for c in old_name if c.isalnum() or c in ' -']).strip()
-    sanitized_new_name = "".join([c for c in new_name if c.isalnum() or c in ' -']).strip()
-    
-    old_path = Path(CONFIG['output_dir']) / sanitized_old_name
-    new_path = Path(CONFIG['output_dir']) / sanitized_new_name
-    
+    course_info = courses_data[course_id]
+    old_repo_name = course_info.get('github_repo')
+    if not old_repo_name:
+        print("ERROR: GitHub repo name not found in JSON. Cannot rename remote.")
+        return False
+
+    # Sanitize names for paths and repo
+    sanitized_new_name = "".join([c for c in new_name if c.isalnum() or c in '-']).replace(' ', '-').strip()
+    old_path = Path(CONFIG['output_dir']) / "".join([c for c in old_name if c.isalnum() or c in ' -']).strip()
+    new_path = Path(CONFIG['output_dir']) / "".join([c for c in new_name if c.isalnum() or c in ' -']).strip()
+
     if not old_path.exists():
-        print(f"  ERROR: Original directory '{old_path}' not found. Cannot create a renamed copy.")
-        return
-        
-    if new_path.exists():
-        print(f"  ERROR: A directory already exists at '{new_path}'. Please choose a different name.")
-        return
+        print(f"ERROR: Local folder '{old_path}' does not exist.")
+        return False
 
-    original_cwd = os.getcwd()
+    original_cwd = Path.cwd()
     try:
-        # 3. Copy the directory
-        shutil.copytree(old_path, new_path)
-        print(f"  ✓ Successfully copied '{old_path}' to '{new_path}'.")
-        
-        # 4. Navigate into the new directory and create a new Git repo
+        # 1️⃣ Rename local folder
+        if old_path != new_path:
+            old_path.rename(new_path)
+            print(f"  ✓ Local folder renamed to '{new_path.name}'")
+
+        # 2️⃣ Rename GitHub repository
         os.chdir(new_path)
-        
-        # Remove the old .git directory if it was copied
-        old_git_dir = new_path / '.git'
-        if old_git_dir.exists():
-            shutil.rmtree(old_git_dir)
-            print("  - Removed old .git directory from the new folder.")
-
-        # Initialize a new Git repository
-        subprocess.run(['git', 'init'], check=True, capture_output=True)
-        subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
-        subprocess.run(['git', 'commit', '-m', f"Initial commit for renamed course: {new_name}"], check=True, capture_output=True)
-        print(f"  ✓ Initialized a new Git repository in '{new_path}'.")
-
-        # 5. Create a new remote GitHub repository
-        new_repo_name = "".join([c for c in new_name if c.isalnum() or c in '-']).strip().replace(' ', '-')
-        print(f"  Creating new PUBLIC GitHub repository '{new_repo_name}'...")
-        
         try:
-            subprocess.run(['gh', 'repo', 'create', new_repo_name, '--public', '--source=.', '--remote=origin'], check=True, capture_output=True, text=True)
-            print(f"  ✓ Successfully created remote GitHub repository '{new_repo_name}'.")
-            
-            # Push to the new remote
-            print("  Pushing to new GitHub repository...")
-            subprocess.run(['git', 'branch', '-M', 'main'], check=True, capture_output=True)
-            subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True, capture_output=True)
-            print("  ✓ Successfully pushed to new repository.")
-            
+            subprocess.run(
+                ['gh', 'repo', 'rename', sanitized_new_name, '--yes'],
+                check=True, capture_output=True, text=True
+            )
+            print(f"  ✓ GitHub repo renamed: {old_repo_name} -> {sanitized_new_name}")
+
+            # Update JSON
+            courses_data[course_id]['full_name'] = new_name
+            courses_data[course_id]['github_repo'] = sanitized_new_name
+            courses_data[course_id]['timestamp'] = datetime.now()
+            courses_data[course_id]['rename'] = ""
+            gcm.save_courses_to_json(courses_data)
+            print("  ✓ Updated JSON with new course and repo name")
+
+            return True
         except subprocess.CalledProcessError as e:
-            print(f"  ✗ ERROR: Failed to create or push to GitHub repository. Details: {e.stderr.strip()}")
-            print("           Please ensure 'gh' CLI is installed and authenticated.")
-            print("           You may need to manually create the repo and push.")
-            
-        # 6. Update the course data in JSON
-        gcm.rename_course_in_json(course_id, new_name)
-        
-    except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        print(f"  ✗ ERROR: A Git or file operation failed. Details: {e}")
-        if isinstance(e, subprocess.CalledProcessError):
-            print(f"     Stderr: {e.stderr}")
-    except Exception as e:
-        print(f"  ✗ ERROR: An unexpected error occurred. Details: {e}")
+            print(f"✗ Failed to rename GitHub repo: {e.stderr.strip()}")
+            return False
     finally:
         os.chdir(original_cwd)
 
-def create_git_repo(course_dir: Path, course_name: str):
-    """Initializes and pushes a git repository for a course."""
+def create_git_repo(course_dir: Path, course: dict):
+    """
+    Initialize a git repo for a course and push it to GitHub.
+    Stores the GitHub repo name in courses.json for future reference.
+    """
+    course_name = course['full_name']
     print(f"\n--- Setting up Git repository for {course_name} ---")
+    
     if not course_dir.is_dir():
         print(f"ERROR: Course directory '{course_dir}' not found.")
         return
-        
-    original_cwd = os.getcwd()
-    os.chdir(course_dir)
+
+    original_cwd = Path.cwd()
+    
+    # 2️⃣ Sanitize GitHub repo name (do this BEFORE changing directory)
+    sanitized_repo_name = "".join([c for c in course_name if c.isalnum() or c in '-']).replace(' ', '-').strip()
+    
     try:
-        # Check if already a git repo
-        if (Path(course_dir) / '.git').exists():
-            print(f"  {course_dir.name} is already a Git repository. Skipping initialization.")
-        else:
+        # 1️⃣ Initialize git repo if it doesn't exist
+        os.chdir(course_dir)
+        if not (course_dir / ".git").exists():
             subprocess.run(['git', 'init'], check=True, capture_output=True)
             subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
             if subprocess.run(['git', 'status', '--porcelain'], capture_output=True).stdout:
-                subprocess.run(['git', 'commit', '-m', f"Initial commit: Gradescope archive for {course_name}"], check=True, capture_output=True)
-                print(f"  Git repository initialized and initial commit made at {course_dir}")
+                subprocess.run(
+                    ['git', 'commit', '-m', f"Initial commit: Gradescope archive for {course_name}"],
+                    check=True, capture_output=True
+                )
+                print("  ✓ Git initialized and initial commit made.")
             else:
-                print(f"  No changes to commit for {course_name}.")
-        
-        # Create GitHub repository and push
-        sanitized_repo_name = "".join([c for c in course_name if c.isalnum() or c in '-']).strip().replace(' ', '-')
-        
-        # Check if remote named 'origin' exists
-        result = subprocess.run(['git', 'remote', '-v'], capture_output=True, text=True)
-        if "origin" not in result.stdout:
-            print(f"  Creating PUBLIC GitHub repository '{sanitized_repo_name}'...")
+                print("  No changes to commit.")
+        else:
+            print("  Git repo already exists. Skipping init.")
+
+        # 3️⃣ Create GitHub repo if remote 'origin' doesn't exist
+        remotes = subprocess.run(['git', 'remote'], capture_output=True, text=True).stdout.split()
+        if 'origin' not in remotes:
             try:
-                subprocess.run(['gh', 'repo', 'create', sanitized_repo_name, '--public', '--source=.', '--remote=origin'], check=True, capture_output=True, text=True)
-                print(f"  ✓ Successfully created remote GitHub repository '{sanitized_repo_name}'.")
+                subprocess.run(
+                    ['gh', 'repo', 'create', sanitized_repo_name, '--public', '--source=.', '--remote=origin'],
+                    check=True, capture_output=True, text=True
+                )
+                print(f"  ✓ GitHub repo created: {sanitized_repo_name}")
             except subprocess.CalledProcessError as e:
-                print(f"  ✗ ERROR: Failed to create GitHub repository. Details: {e.stderr.strip()}")
-                print("           Please ensure 'gh' CLI is installed and authenticated.")
-                # Continue without pushing if repo creation fails
+                print(f"  ✗ Failed to create GitHub repo: {e.stderr.strip()}")
                 return
         else:
-            print(f"  Remote 'origin' already exists. Skipping remote repository creation.")
+            print("  Remote 'origin' already exists. Skipping creation.")
 
-        print("  Pushing to GitHub...")
+        # 4️⃣ Push to GitHub
         subprocess.run(['git', 'branch', '-M', 'main'], check=True, capture_output=True)
         subprocess.run(['git', 'push', '-u', 'origin', 'main', '--force'], check=True, capture_output=True)
-        print(f"  ✓ Successfully pushed to GitHub repository: {sanitized_repo_name}")
-        
-    except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        print(f"  ✗ ERROR: Git/GitHub operation failed for {course_name}. Details: {e}")
-        if isinstance(e, subprocess.CalledProcessError):
-            print(f"     Stdout: {e.stdout.decode().strip()}")
-            print(f"     Stderr: {e.stderr.decode().strip()}")
-        print("           Please ensure 'gh' CLI is installed and authenticated and Git is configured.")
-    except Exception as e:
-        print(f"  ✗ ERROR: An unexpected error occurred during Git operations. Details: {e}")
+        print(f"  ✓ Successfully pushed to GitHub: {sanitized_repo_name}")
+
     finally:
+        # IMPORTANT: Change back to original directory BEFORE updating JSON
         os.chdir(original_cwd)
 
+    # 5️⃣ Store GitHub repo name in JSON (OUTSIDE the try/finally block, after chdir back)
+    courses_data = gcm.load_courses_from_json()
+    course_id = course['url']
+    
+    # Ensure there is an entry for this course in the JSON
+    if course_id not in courses_data:
+        raise ValueError(
+            f"Course ID '{course_id}' not found in courses.json! "
+            f"Please run --update-courses first to populate the courses database."
+        ) 
+    
+    courses_data[course_id]['github_repo'] = sanitized_repo_name
+
+    gcm.save_courses_to_json(courses_data)
+    print(f"  ✓ Stored GitHub repo name in courses.json under ID '{course_id}'")
+
+
 def interactive_workflow(page: Page):
-    """Runs the archiver in an interactive loop."""
+    """Runs the archiver in an interactive loop safely."""
     while True:
         print("\n--- Gradescope Archiver Interactive Mode ---")
         all_courses = get_courses(page)
-        if not all_courses: break
-        for i, c in enumerate(all_courses): print(f"{i+1}. {c['full_name']}")
+        if not all_courses:
+            print("No courses found. Exiting.")
+            break
+        
+        for i, c in enumerate(all_courses):
+            print(f"{i+1}. {c['full_name']}")
+        
         choice = input("\nEnter a number to process, or 'q' to quit: ").strip().lower()
-        if choice == 'q': break
+        if choice == 'q':
+            break
+        
         try:
             course = all_courses[int(choice) - 1]
-            download_course(page, course, CONFIG['output_dir'])
-            if input("Create and push Git repository? (y/n): ").lower() == 'y':
-                sanitized_name = "".join([c for c in course['full_name'] if c.isalnum() or c in ' -']).strip()
-                create_git_repo(Path(CONFIG['output_dir']) / sanitized_name, course['full_name'])
-            if input("Delete local folder after push? (y/n): ").lower() == 'y':
-                shutil.rmtree(Path(CONFIG['output_dir']) / sanitized_name)
-                print("Local directory deleted.")
+            
+            # Download graded assignments
+            course_id = course['url']  # Use the Gradescope course URL as the unique ID
+            download_course(page, course, course_id, CONFIG['output_dir'])
+            
+            # Ask if user wants to create Git repo
+            if input("Create and push Git repository? (y/n): ").strip().lower() == 'y':
+                sanitized_name = "".join(c if c.isalnum() or c in ' -' else '-' for c in course['full_name']).strip()
+                repo_dir = Path(CONFIG['output_dir']) / sanitized_name
+                success = create_git_repo(repo_dir, course) 
+                
+                # Only offer delete if push succeeded
+                if success and input("Delete local folder after push? (y/n): ").strip().lower() == 'y':
+                    shutil.rmtree(repo_dir)
+                    print("Local directory deleted safely.")
+        
         except (ValueError, IndexError):
-            print("Invalid input.")
+            print("Invalid input. Please enter a valid number.")
         except Exception as e:
             print(f"An error occurred: {e}")

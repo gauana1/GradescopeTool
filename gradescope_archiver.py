@@ -63,7 +63,8 @@ def main():
                 
                 sanitized_name = "".join([c for c in course['full_name'] if c.isalnum() or c in ' -']).strip()
                 course_dir = Path(gs_lib.CONFIG['output_dir']) / sanitized_name
-                gs_lib.create_git_repo(course_dir, course['full_name'])
+                gs_lib.create_git_repo(course_dir, course)  # pass full dict
+ 
             print("\n--- All courses have been processed. ---")
         elif args.test_course:
             print(f"--- Testing download for course: {args.test_course} ---")
@@ -75,7 +76,10 @@ def main():
                 
                 sanitized_name = "".join([c for c in target_course['full_name'] if c.isalnum() or c in ' -']).strip()
                 course_dir = Path(gs_lib.CONFIG['output_dir']) / sanitized_name
-                gs_lib.create_git_repo(course_dir, target_course['full_name'])
+                
+                # ✅ Create Git repo so JSON gets updated
+                gs_lib.create_git_repo(course_dir, target_course)
+                
                 print(f"\n--- Test download finished for {args.test_course}. ---")
             else:
                 print(f"ERROR: Course '{args.test_course}' not found.")
@@ -109,7 +113,7 @@ def main():
                     
                     sanitized_name = "".join([c for c in course_data['full_name'] if c.isalnum() or c in ' -']).strip()
                     course_dir = Path(gs_lib.CONFIG['output_dir']) / sanitized_name
-                    gs_lib.create_git_repo(course_dir, course_data['full_name'])
+                    gs_lib.create_git_repo(course_dir, course_data)
             
             print("\n--- Stale course update finished. ---")
         else:
