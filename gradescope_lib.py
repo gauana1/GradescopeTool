@@ -157,93 +157,124 @@ def download_assignment(page: Page, assignment_name: str, assignment_url: str, a
     time.sleep(CONFIG['delay'])
 
 
+def _download_file_with_requests(page: Page, url: str, assignment_dir: Path) -> bool:
+    """Downloads a file from a given URL using requests."""
+    try:
+        cookies = {c['name']: c['value'] for c in page.context.cookies()}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
+        }
+        
+        print(f"    Downloading via requests from: {url[:60]}...")
+        response = requests.get(url, cookies=cookies, headers=headers, allow_redirects=True, timeout=20)
+        response.raise_for_status()
+
+        filename = "downloaded_file"
+        if 'content-disposition' in response.headers:
+            d = response.headers['content-disposition']
+            found_filenames = re.findall('filename="?([^"]+)"?', d)
+            if found_filenames:
+                filename = found_filenames[0]
+        else:
+            parsed_url_path = Path(requests.utils.urlparse(url).path)
+            if parsed_url_path.name:
+                filename = parsed_url_path.name
+        
+        filename = "".join(c for c in filename if c.isalnum() or c in '._- ').strip()
+        filepath = assignment_dir / filename
+
+        filepath.write_bytes(response.content)
+        
+        print(f"      ✓ Downloaded: '{filename}'")
+        
+        # Extract archive if applicable
+        _extract_if_archive(filepath, assignment_dir)
+        
+        return True
+    except Exception as e:
+        print(f"      ✗ Download failed. Details: {str(e)[:100]}")
+        return False
+
 def _try_direct_downloads(page: Page, assignment_name: str, assignment_dir: Path) -> int:
     """
-    Attempt to download all available files directly. 
-    Extract only top-level archives. Returns the count of successful downloads.
+    Attempt to download all available files directly using a generalized requests-based method.
     """
-    print("    Looking for direct download links...")
+    print("    Looking for direct download links (using requests-based method)...")
     
-    # direct_download_selectors = [
-    #     'a[href*="/download_submission"]',
-    #     'a[download]',
-    #     'a[href$=".zip"]',
-    #     'a[href$=".tar.gz"]',
-    #     'a[href$=".tar"]',
-    #     'a[href$=".tgz"]',
-    #     'a[href$=".py"]',
-    #     'a[href$=".java"]',
-    #     'a[href$=".cpp"]',
-    #     'a[href$=".c"]',
-    #     'a[href$=".h"]',
-    #     'a[href$=".txt"]',
-    #     'a[href$=".pdf"]',
-    #     'a:has-text("Download Graded Copy")',  # Specific selector for graded PDF
-    # ]
+    direct_download_selectors = [
+        'a[href*="/download_submission"]',
+        'a[download]',
+        'a[href$=".zip"]',
+        'a[href$=".tar.gz"]',
+        'a[href$=".tar"]',
+        'a[href$=".tgz"]',
+        'a[href$=".py"]',
+        'a[href$=".java"]',
+        'a[href$=".cpp"]',
+        'a[href$=".c"]',
+        'a[href$=".h"]',
+        'a[href$=".txt"]',
+        'a[href$=".pdf"]',
+        'a:has-text("Download Graded Copy")',
+    ]
     
     successful_downloads = 0
-    # downloaded_urls = set()  # Avoid duplicate downloads
+    downloaded_urls = set()
 
-    # for selector in direct_download_selectors:
-    #     links = page.locator(selector).all()
+    for selector in direct_download_selectors:
+        links = page.locator(selector).all()
         
-    #     for i, link in enumerate(links):
-    #         try:
-    #             href = link.get_attribute('href')
-    #             if not href or href in downloaded_urls:
-    #                 continue
+        for i, link in enumerate(links):
+            try:
+                href = link.get_attribute('href')
+                if not href or href in downloaded_urls:
+                    continue
+
+                url = f"https://www.gradescope.com{href}" if href.startswith('/') else href
+                downloaded_urls.add(href)
                 
-    #             print(f"    Attempting download {i+1} (selector: '{selector}', href: '{href[:50]}...')")
+                if _download_file_with_requests(page, url, assignment_dir):
+                    successful_downloads += 1
                 
-    #             with page.expect_download(timeout=15000) as d_info:
-    #                 link.click()
-                
-    #             download = d_info.value
-    #             filename = download.suggested_filename
-    #             filepath = assignment_dir / filename
-    #             download.save_as(filepath)
-                
-    #             print(f"      ✓ Downloaded: '{filename}'")
-    #             successful_downloads += 1
-    #             downloaded_urls.add(href)
-                
-    #             # Extract top-level archive only
-    #             _extract_if_archive(filepath, assignment_dir)
-                
-    #         except Exception as e:
-    #             print(f"      ✗ Download failed (selector: '{selector}'). Details: {str(e)[:100]}")
-    #             continue
+            except Exception as e:
+                print(f"      ✗ Failed to process link (selector: '{selector}'). Details: {str(e)[:100]}")
+                continue
     
-    # Fallback: attempt to download graded PDF via requests if nothing downloaded
-    if successful_downloads == 0 and _try_graded_pdf_download_requests(page, assignment_name, assignment_dir):
-        successful_downloads += 1
-
     return successful_downloads
+def _extract_if_archive(filepath: Path, extract_to: Path, depth=0):
+    """Recursively extract archives up to one level deep."""
+    if depth > 1:
+        return
 
-
-def _extract_if_archive(filepath: Path, extract_to: Path):
-    """Extract only the top-level archive (no nested extraction)."""
     ext = _get_full_extension(filepath)
     
     if ext not in ['.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2']:
-        return  # Not an archive
-    
-    print(f"      Detected archive: {ext}. Extracting to top level...")
+        return
+
+    print(f"      - Detected archive: '{filepath.name}'. Extracting...")
     
     try:
+        extracted_files = []
         if ext == '.zip':
             with zipfile.ZipFile(filepath, 'r') as zf:
                 zf.extractall(extract_to)
+                extracted_files = [extract_to / name for name in zf.namelist()]
         else:  # Various tar formats
             with tarfile.open(filepath, 'r:*') as tf:
                 tf.extractall(extract_to)
+                extracted_files = [extract_to / name for name in tf.getnames()]
         
-        print(f"      ✓ Extracted top-level archive to '{extract_to}'")
-        filepath.unlink()  # Delete the archive after extraction
-        print(f"      Deleted original archive: '{filepath.name}'")
-        
+        print(f"      ✓ Extracted '{filepath.name}'.")
+        filepath.unlink() # Delete the archive that was just extracted
+
+        # Recursively check extracted files
+        for item_path in extracted_files:
+            if item_path.is_file():
+                _extract_if_archive(item_path, item_path.parent, depth + 1)
+
     except Exception as e:
-        print(f"      ✗ Extraction failed: {e}")
+        print(f"      ✗ Extraction failed for '{filepath.name}': {e}")
 
 
 def _get_full_extension(filepath: Path) -> str:
@@ -257,53 +288,6 @@ def _get_full_extension(filepath: Path) -> str:
     else:
         return filepath.suffix.lower()
 
-
-def _try_graded_pdf_download_requests(page: Page, assignment_name: str, assignment_dir: Path) -> bool:
-    """Attempt to download the graded PDF directly via requests, with retries. Returns True if successful."""
-    for i in range(CONFIG['max_retries']):
-        try:
-            download_link_locator = page.get_by_role("link", name="Download Graded Copy")
-            pdf_url = download_link_locator.get_attribute('href', timeout=2000)
-            
-            if not pdf_url:
-                print("      ✗ Could not extract PDF URL for requests download.")
-                return False
-            
-            if pdf_url.startswith('/'):
-                pdf_url = f"https://www.gradescope.com{pdf_url}"
-            
-            cookies = {c['name']: c['value'] for c in page.context.cookies()}
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                             'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
-            }
-            
-            print(f"    Downloading PDF directly via requests from: {pdf_url[:60]}...")
-            response = requests.get(pdf_url, cookies=cookies, headers=headers, allow_redirects=True)
-            
-            if 500 <= response.status_code < 600:
-                print(f"      ! Server error ({response.status_code}). Retrying in {CONFIG['delay']}s... (Attempt {i+1}/{CONFIG['max_retries']})")
-                time.sleep(CONFIG['delay'])
-                continue # Go to the next iteration of the retry loop
-            
-            response.raise_for_status() # Raise an exception for other bad status codes (4xx)
-            
-            safe_name = "".join(c for c in assignment_name if c.isalnum() or c in '._- ').strip()
-            filename = f"{safe_name}_graded.pdf"
-            filepath = assignment_dir / filename
-            
-            filepath.write_bytes(response.content)
-            print(f"      ✓ Saved (requests): '{filename}'")
-            return True # Success
-            
-        except Exception as e:
-            print(f"      ✗ PDF download (requests) failed: {e}")
-            if i < CONFIG['max_retries'] - 1:
-                time.sleep(CONFIG['delay'])
-            continue # Go to the next iteration of the retry loop
-
-    print(f"      ✗ PDF download failed after {CONFIG['max_retries']} retries.")
-    return False
 def download_course(page: Page, course: dict, course_id: str, output_dir: str):
     """Downloads all graded assignments for one course."""
     print(f"\nProcessing course: {course['full_name']}")
@@ -357,7 +341,7 @@ def _get_github_username():
                 ['gh', 'api', 'user', '--jq', '.login'],
                 check=True, capture_output=True, text=True
             )
-            GITHUB_USERNAME = result.stdout.strip()
+            GITHUB_USERNAME =result.stdout.strip()
             print(f"  ✓ Fetched GitHub username: {GITHUB_USERNAME}")
         except subprocess.CalledProcessError as e:
             print(f"  ✗ Failed to fetch GitHub username: {e.stderr.strip()}")
@@ -493,8 +477,16 @@ def create_git_repo(course_dir: Path, course: dict):
                 )
                 print(f"  ✓ GitHub repo created: {sanitized_repo_name} ({visibility_flag.strip('--')})")
             except subprocess.CalledProcessError as e:
-                print(f"  ✗ Failed to create GitHub repo: {e.stderr.strip()}")
-                return False
+                stderr = e.stderr.strip()
+                if "Name already exists on this account" in stderr:
+                    print(f"  - GitHub repo '{sanitized_repo_name}' already exists. Proceeding.")
+                    github_username = _get_github_username()
+                    remote_url = f"https://github.com/{github_username}/{sanitized_repo_name}.git"
+                    subprocess.run(['git', 'remote', 'add', 'origin', remote_url], check=True)
+                    print("  ✓ Added remote 'origin'.")
+                else:
+                    print(f"  ✗ Failed to create GitHub repo: {stderr}")
+                    return False
         else:
             print("  Remote 'origin' already exists. Skipping creation.")
 
