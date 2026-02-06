@@ -333,7 +333,7 @@ def download_course(page: Page, course: dict, course_id: str, output_dir: str):
 
 GITHUB_USERNAME = None
 
-def _get_github_username():
+def get_github_username():
     global GITHUB_USERNAME
     if GITHUB_USERNAME is None:
         try:
@@ -393,7 +393,7 @@ def rename_course_repo(old_name: str, new_name: str, course_id: str):
 
         # Part 2: Handle GitHub repo rename
         try:
-            github_username = _get_github_username()
+            github_username = get_github_username()
             if not github_username:
                 print("  ✗ Cannot rename remote GitHub repo without username.")
                 return False

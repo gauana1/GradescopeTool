@@ -4,6 +4,7 @@ from playwright.sync_api import sync_playwright
 from datetime import datetime
 import json
 import shutil
+import subprocess
 import gradescope_lib as gs_lib
 import gradescope_course_manager as gcm
 
@@ -19,6 +20,7 @@ def main():
     parser.add_argument('--update-courses', action='store_true', help='Update the courses.json file with the latest course list.')
     parser.add_argument('--update-stale-courses', action='store_true', help='Re-download courses that have not been updated recently.')
     parser.add_argument('--rename-courses', action='store_true', help='Rename local course directories based on the "rename" field in courses.json.')
+    parser.add_argument('--nuke-all', action='store_true', help='Delete all GitHub repositories listed in courses.json.')
     args = parser.parse_args()
 
     if args.setup:
@@ -40,6 +42,46 @@ def main():
                     gcm.rename_course_in_json(course_id, course_data['rename'])
         
         print("\n--- Course renaming finished. ---")
+        return
+
+    if args.nuke_all:
+        print("--- WARNING: This will permanently delete all GitHub repositories listed in courses.json. ---")
+        if input("Are you sure you want to continue? (y/n): ").strip().lower() != 'y':
+            print("Nuke aborted.")
+            return
+
+        courses_data = gcm.load_courses_from_json()
+        if not courses_data:
+            print("courses.json is empty. Nothing to nuke.")
+            return
+
+        github_username = gs_lib.get_github_username()
+        if not github_username:
+            print("Could not get GitHub username. Aborting nuke.")
+            return
+
+        for course_id, course_data in courses_data.items():
+            repo_name = course_data.get('github_repo')
+            if repo_name:
+                full_repo_path = f"{github_username}/{repo_name}"
+                print(f"  - Deleting GitHub repo: {full_repo_path}")
+                try:
+                    subprocess.run(
+                        ['gh', 'repo', 'delete', full_repo_path, '--yes'],
+                        check=True, capture_output=True, text=True
+                    )
+                    print(f"    ✓ Deleted {full_repo_path}")
+                    courses_data[course_id]['github_repo'] = ""
+                except subprocess.CalledProcessError as e:
+                    stderr = e.stderr.strip()
+                    if "404" in stderr or "Not Found" in stderr:
+                        print(f"    - Repo {full_repo_path} not found on GitHub. Skipping.")
+                        courses_data[course_id]['github_repo'] = "" # Still clear it
+                    else:
+                        print(f"    ✗ Failed to delete {full_repo_path}: {stderr}")
+        
+        gcm.save_courses_to_json(courses_data)
+        print("\n--- Nuke operation finished. ---")
         return
 
     if not Path(gs_lib.CONFIG['auth_file']).exists():
